@@ -878,6 +878,10 @@ def _call_solver_ckmt(  N,
     for (idx, (i, j)) in enumerate(E):
         e_val[idx] = s_val[i] * s_len[j] + s_val[j]
     
+    A_val = []
+    for i in range(T):
+        A_val.append([j for j in range(N) if A[i,j].X == 1])
+    
     # Check correctness
     for (idx, (i, j)) in enumerate(E):
         i_spec_index = e_val[idx] // s_len[j]
@@ -893,7 +897,7 @@ def _call_solver_ckmt(  N,
             peak_mem = max(peak_mem, model.getVarByName(f'U[{t},{k}]').X)
     
     print(s_val)
-    return s_val, e_val, model.ObjVal, None
+    return s_val, e_val, A_val, model.ObjVal, None
 
 # pylint: disable=import-outside-toplevel
 def _call_solver_serialized_args(N,
