@@ -630,6 +630,7 @@ def _call_solver_ckmt(  N,
                         v_np,
                         elementwise_np,
                         param_np,
+                        tuple_np,
                         s_init_np=None):
     
     import gurobipy as gp
@@ -692,10 +693,10 @@ def _call_solver_ckmt(  N,
     assert pt == len(d_np), f"{pt} == {len(d_np)}"
     assert pt == len(m_np), f"{pt} == {len(m_np)}"
 
-    # Nothing needed for param and elementwise indexes
+    # Nothing needed for param, elementwise, tuple indexes
     elementwise_idx = elementwise_np
     param_idx = param_np
-
+    tuple_idx = tuple_np
 
     def get_parent(i):
         ps = []
@@ -795,6 +796,13 @@ def _call_solver_ckmt(  N,
         start = [idx for (idx, s) in enumerate(segments) if s[0] > i][0]
         model.addLConstr(quicksum(A[t, i] for t in range(start, T)), GRB.EQUAL, 0)
     
+    # Never recompute tuples
+    for i in tuple_idx:
+        for t in range(T):
+            if i >= segments[t][0] and i < segments[t][1]:
+                continue
+            model.addConstr(A[t, i] == 0)
+    
     model.setObjective(
         quicksum(A[t, i] * ((S[i] @ c[i]).item() + (S[i] @ d[i]).item()) for t in range(T) for i in range(segments[t][1])) +
         quicksum(A[t, i] * (E_sol[get_edge_idx(v, i)] @ r[get_edge_idx(v, i)]).item() for t in range(T) for i in range(segments[t][1]) for v in get_parent(i)),
@@ -878,9 +886,9 @@ def _call_solver_ckmt(  N,
     for (idx, (i, j)) in enumerate(E):
         e_val[idx] = s_val[i] * s_len[j] + s_val[j]
     
-    A_val = []
+    R_val = []
     for i in range(T):
-        A_val.append([j for j in range(N) if A[i,j].X == 1])
+        R_val.append([j for j in range(N) if A[i,j].X == 1])
     
     # Check correctness
     for (idx, (i, j)) in enumerate(E):
@@ -896,8 +904,7 @@ def _call_solver_ckmt(  N,
         for k in range(N):
             peak_mem = max(peak_mem, model.getVarByName(f'U[{t},{k}]').X)
     
-    print(s_val)
-    return s_val, e_val, A_val, model.ObjVal, None
+    return s_val, e_val, R_val, segments, model.ObjVal, None
 
 # pylint: disable=import-outside-toplevel
 def _call_solver_serialized_args(N,
