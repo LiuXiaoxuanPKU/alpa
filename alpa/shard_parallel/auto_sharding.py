@@ -305,6 +305,7 @@ def run_auto_sharding_pass(
                 force_batch_dim_to_mesh_dim,
             "auto_sharding::force_simple_heuristic":
                 as_option.force_simple_heuristic,
+            "auto_sharding::use_ckmt": True,
 
             # Device mesh
             "auto_sharding::device_mesh_ids":
@@ -594,8 +595,10 @@ def call_solver_serialized_args(*args):
     """Call the solver with serialized arguments and handle python errors."""
     info = ""
     try:
-        ret = _call_solver_ckmt(*args)
-        # ret = _call_solver_serialized_args(*args)
+        if True:
+            ret = _call_solver_ckmt(*args)
+        else:
+            ret = _call_solver_serialized_args(*args)
     except AssertionError:
         ret = None
         info = str(traceback.format_exc()[:-1])
@@ -709,7 +712,7 @@ def _call_solver_ckmt(  N,
         ps = []
         for (src, dst) in E:
             if src == i:
-                ps.append(src)
+                ps.append(dst)
         return ps        
     
     def get_edge_idx(src, dst):
@@ -921,6 +924,7 @@ def _call_solver_serialized_args(N,
                                  v_np,
                                  elementwise_np,
                                  param_np,
+                                 tuple_np,
                                  s_init_np=None):
     """Call the solver with serialized arguments."""
     # pylint: disable=invalid-name
@@ -1163,7 +1167,7 @@ def _call_solver_serialized_args(N,
     if objective > INFINITY_COST:
         warnings.warn("Detect unexpected behaviors in the auto-sharding pass.")
 
-    return s_val, e_val, objective, status
+    return s_val, e_val, [], [], objective, status
 
 
 # Auto-sharded pipeline stages.
