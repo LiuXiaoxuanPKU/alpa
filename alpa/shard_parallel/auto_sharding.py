@@ -686,6 +686,8 @@ def _call_solver_ckmt(  N,
     d = []
     m = []
     pt = 0
+    # compute cost is at list 1 so that ckmt will not compute reduant nodes
+    c_np = np.clip(c_np, 1, max(c_np))
     for i in range(N):
         length = s_len[i]
         c.append(c_np[pt:pt + length])
