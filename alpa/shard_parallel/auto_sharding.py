@@ -43,7 +43,8 @@ logger.setLevel(logging.INFO)
 
 # A constant to represent infinity
 INFINITY_COST = 1e13
-
+use_ckmt = True
+memory_budget = int(0.7 * 1024 * 1024 * 1024)
 
 @dataclasses.dataclass
 class AutoShardingOption:
@@ -206,7 +207,7 @@ def run_auto_sharding_pass(
     # pylint: disable=unused-argument
     # Set compile options
     if memory_budget_per_device is None:
-        memory_budget_per_device = -1
+        memory_budget_per_device = memory_budget
     assert hlo.is_unoptimized()
 
     multiple_stages = return_mode in ["stages", "stages_and_hook"]
@@ -305,7 +306,7 @@ def run_auto_sharding_pass(
                 force_batch_dim_to_mesh_dim,
             "auto_sharding::force_simple_heuristic":
                 as_option.force_simple_heuristic,
-            "auto_sharding::use_ckmt": True,
+            "auto_sharding::use_ckmt": use_ckmt,
 
             # Device mesh
             "auto_sharding::device_mesh_ids":
@@ -333,7 +334,7 @@ def run_auto_sharding_pass(
 
             # Debug options
             "auto_sharding::simplify_graph":
-                True,
+                False,
             "auto_sharding::print_strategy":
                 os.environ.get("ALPA_DEBUG_PRINT_AS_STRATEGY", "False").lower()
                 in ["true", "1"],
@@ -595,7 +596,7 @@ def call_solver_serialized_args(*args):
     """Call the solver with serialized arguments and handle python errors."""
     info = ""
     try:
-        if True:
+        if use_ckmt:
             ret = _call_solver_ckmt(*args)
         else:
             ret = _call_solver_serialized_args(*args)
@@ -619,7 +620,7 @@ last_s_val = None
 # The last objective value of the best ILP solution.
 last_objective = None
 
-def _call_solver_ckmt(  N,
+def _call_solver_ckmt_experimental(  N,
                         M,
                         s_len_np,
                         s_follow_np,
@@ -639,8 +640,8 @@ def _call_solver_ckmt(  N,
     import gurobipy as gp
     from gurobipy import GRB, quicksum
 
-    print("IN CALL SOLVER CHECKMATE")
-    print(f"{N} nodes, {len(elementwise_np)} Elementwise Ops, {len(param_np)} Params")
+    print("IN CALL SOLVER CHECKMATE EXPERIMENTAL")
+    print(f"{N} nodes, {len(elementwise_np)} Elementwise Ops, {len(param_np)} Params, {M/1024/1024} MB memory limit")
 
     for x in [s_len_np, E_np, A_np, L_np, c_np, d_np, m_np, r_np, v_np]:
         assert isinstance(x, np.ndarray)
@@ -686,11 +687,335 @@ def _call_solver_ckmt(  N,
     d = []
     m = []
     pt = 0
-    # compute cost is at list 1 so that ckmt will not compute reduant nodes
-    c_np = np.clip(c_np, 1, max(c_np))
+    # compute cost is at least 1 so that ckmt will not compute readudant nodes
     for i in range(N):
         length = s_len[i]
-        c.append(c_np[pt:pt + length])
+        c.append(np.clip(c_np[pt:pt + length], 10, max(10, max(c_np[pt:pt + length]))))
+        d.append(d_np[pt:pt + length])
+        m.append(m_np[pt:pt + length])
+        pt += length
+    assert pt == len(c_np), f"{pt} == {len(c_np)}"
+    assert pt == len(d_np), f"{pt} == {len(d_np)}"
+    assert pt == len(m_np), f"{pt} == {len(m_np)}"
+
+    # Nothing needed for param, elementwise, tuple indexes
+    elementwise_idx = elementwise_np
+    param_idx = param_np
+    tuple_idx = tuple_np
+
+    def get_parent(i):
+        ps = []
+        for (src, dst) in E:
+            if dst == i:
+                ps.append(src)
+        return ps
+    
+    def get_child(i):
+        ps = []
+        for (src, dst) in E:
+            if src == i:
+                ps.append(dst)
+        return ps        
+    
+    def get_edge_idx(src, dst):
+        for idx, (i, j) in enumerate(E):
+            if i == src and j == dst:
+                return idx
+        assert(False)
+    
+
+    def get_non_zero_index(bv):
+        """Get the index of non-zero item in a vector."""
+        for j, ele in enumerate(bv):
+            if abs(ele - 1) < 0.001:
+                return j
+        return 0
+    
+    model = gp.Model("checkmate experimental")
+    model.Params.TimeLimit = 1000
+    model.Params.MIPFocus = 1
+
+    T = int(np.sqrt(N))
+    stage_size = int(N // T)
+    segments = []
+    for i in range(T):
+        segments.append([i * stage_size, (i + 1) * stage_size])
+    if N % stage_size > 0:
+        segments.append([T * stage_size, N])
+    T = len(segments)
+
+    def get_segment_idx(i):
+        for idx, (start, end) in enumerate(segments):
+            if i >= start and i < end:
+                return idx
+    
+    E_seg = []
+    for (i, j) in E:
+        i_seg = get_segment_idx(i)
+        j_seg = get_segment_idx(j)
+
+        if i_seg == j_seg:
+            continue
+
+        if (i_seg, j_seg) not in E_seg:
+            E_seg.append((i_seg, j_seg))
+
+    def get_segmented_edge_idx(src_seg, dst_seg):
+        for idx, (i_seg, j_seg) in enumerate(E_seg):
+            if i_seg == src_seg and j_seg == dst_seg:
+                return idx
+        assert(False)
+
+    def get_segment_parent(i_seg):
+        ps = []
+        for (src_seg, dst_seg) in E_seg:
+            if dst_seg == i_seg:
+                ps.append(src_seg)
+        return ps    
+        
+    def get_segment_child(i_seg):
+        ps = []
+        for (src_seg, dst_seg) in E_seg:
+            if src_seg == i_seg:
+                ps.append(dst_seg)
+        return ps
+
+    ##################################Create Variables##############################
+    A = model.addVars(T, T, name="A", vtype=GRB.BINARY, lb=0.0, ub=1.0)
+    B = model.addVars(T, T, name="B", vtype=GRB.BINARY, lb=0.0, ub=1.0)
+    U = model.addVars(T, T, name="U", lb=0, ub=M)
+    FREE = model.addVars(T, len(E_seg), name="FREE", vtype=GRB.BINARY, lb=0.0, ub=1.0)
+
+    num_nodes = 0
+    reverse_follow_backpatch = []
+    S = []
+    for i in range(N):
+        if s_follow[i] < 0:
+            if s_len[i] == 1:
+                S.append(np.array([1]))
+            else:
+                num_nodes += 1
+                S.append(model.addMVar(s_len[i], lb=0, ub=1, vtype=GRB.BINARY, name=f'S[{i}]'))
+        else:
+            if s_follow[i] < len(S):
+                S.append(S[s_follow[i]])
+            else:
+                S.append(None)
+                reverse_follow_backpatch.append(i)
+
+    for i in reverse_follow_backpatch:
+        S[i] = S[s_follow[i]]
+    
+
+    # # Never checkpoint elementwise ops
+    # comment this for now for debugging (recompuet as few nodes as possible)
+    # for i in elementwise_idx:
+    #     for t in range(T):
+    #         B[t, i] = 0
+    
+    E_sol = []
+    for (i, j) in E:
+        if s_len[i] == 1:
+            E_sol.append(S[j])
+        elif s_len[j] == 1:
+            E_sol.append(S[i])
+        else:
+            E_sol.append(model.addMVar(s_len[i] * s_len[j], lb=0, ub=1, vtype=GRB.BINARY, name=f'E[{i}][{j}]'))
+    
+    # TODO: FIGURE OUT HOW TO DO THIS
+    # Never recompute parameters
+    # for i in param_idx:
+    #     start = [idx for (idx, s) in enumerate(segments) if s[0] > i][0]
+    #     model.addLConstr(quicksum(A[t, i] for t in range(start, T)), GRB.EQUAL, 0)
+    
+    # TODO: FIGURE OUT HOW TO DO THIS
+    # Never recompute tuples
+    # for i in tuple_idx:
+    #     for t in range(T):
+    #         if i >= segments[t][0] and i < segments[t][1]:
+    #             continue
+    #         model.addConstr(A[t, i] == 0)
+    
+    m.setObjective(
+        quicksum(A[t, get_segment_idx(i)] * ((S[i] @ c[i]).item() + (S[i] @ d[i]).item()) for t in range(T) for i in range(segments[t][1])) +
+        quicksum(A[t, get_segment_idx(i)] * (E_sol[get_edge_idx(v, i)] @ r[get_edge_idx(v, i)]).item() for t in range(T) for i in range(segments[t][1]) for v in get_parent(i)),
+        GRB.MINIMIZE
+    )
+
+    #################################Constraints#######################################
+    for idx, (i_seg, j_seg) in enumerate(E_seg):
+        for t in range(T):
+            m.addLConstr(A[t, j_seg], GRB.LESS_EQUAL, A[t, i_seg] + B[t, i_seg])
+
+    for i_seg in range(T):
+        for t in range(1, T):
+            m.addLConstr(B[t, i_seg], GRB.LESS_EQUAL, A[t-1, i_seg] + B[t-1, i_seg])
+
+    for t in range(T):
+        model.addConstr(U[t, 0], GRB.EQUAL,
+                    quicksum([(S[i] @ m[i]).item() * B[t, get_segment_idx(i)] for i in range(N)])
+                    + quicksum([A[t, 0] * (S[i] @ m[i]).item() for i in range(segments[0][1])]))
+        
+    for t in range(T):
+        for k in range(N - 1):
+            mem_freed = quicksum([(S[i] @ m[i]).item() * FREE[t, get_edge_idx(i, k)] for i in get_parent(k)])
+            model.addConstr(U[t, k+1], GRB.EQUAL, U[t, k] - mem_freed + A[t, k+1] * (S[k+1] @ m[k+1]).item())
+    
+    for t in range(T):
+        for k_seg in range(T - 1):
+            mem_freed = quicksum([(S[j] @ m[j]).item() * FREE[t, get_segmented_edge_idx(i_seg, k_seg)]
+                                  for i_seg in get_segment_parent(k_seg) for j in range(segments[i_seg][0], segments[i_seg][1])])
+            m.addConstr(U[t, k_seg+1], GRB.EQUAL, U[t, k_seg] - mem_freed + 
+                            quicksum([A[t, k_seg+1] * (S[j] @ m[j]).item() for j in range(segments[k_seg+1][0], segments[k_seg+1][1])]))
+
+    def _num_hazard(t, i, k):
+        if t < T - 1:
+            return 1 - A[t, k] + B[t+1, i] + quicksum(A[t, j] for j in get_segment_child(i) if j > k)
+        return 1 - A[t, k] + quicksum(A[t, j] for j in get_segment_child(i) if j > k)
+
+    def _num_hazard_max(t, i, k):
+        if t < T - 1:
+            return 2 + sum([1 for j in get_segment_child(i) if j > k])
+        return 1 + sum([1 for j in get_segment_child(i) if j > k])
+    
+    for t in range(T):  
+        for (i_seg, k_seg) in E_seg:
+            m.addConstr(1 - FREE[t, get_segmented_edge_idx(i_seg, k_seg)], GRB.LESS_EQUAL, _num_hazard(t, i_seg, k_seg))
+            m.addConstr(_num_hazard(t, i_seg, k_seg), GRB.LESS_EQUAL, _num_hazard_max(t, i_seg, k_seg) * (1 - FREE[t, get_segmented_edge_idx(i_seg, k_seg)]))
+    
+    for t in range(T):
+        m.addConstr(A[t, t], GRB.EQUAL, 1)
+
+    for t in range(T):
+        for i in range(T):
+            if i >= t:
+                m.addConstr(B[t, i], GRB.EQUAL, 0)
+            if i >= t + 1:
+                m.addConstr(A[t, i], GRB.EQUAL, 0)
+
+    for i in range(N):
+        if s_len[i] > 1:
+            m.addConstr(quicksum(S[i]).item(), GRB.EQUAL, 1)
+    
+    for idx in range(len(E_sol)):
+        if not isinstance(E_sol[idx], np.ndarray):
+            m.addConstr(quicksum(E_sol[idx]).item(), GRB.EQUAL, 1)
+    
+    for idx, (i, j) in enumerate(E):
+        if s_len[i] > 1:
+            for row in range(s_len[i]):
+                C = s_len[j]
+                model.addConstr(quicksum([E_sol[idx][row * C + col] for col in range(C)]) <= S[i][row])
+        if s_len[j] > 1:
+            for col in range(s_len[j]):
+                R = s_len[i]
+                C = s_len[j]
+                model.addConstr(quicksum([E_sol[idx][row * C + col] for row in range(R)]) <= S[j][col])
+    
+    model.optimize()
+    s_val = np.full((N,), -1, dtype=np.int32)
+    for i in range(N):
+        if s_len[i] == 1:
+            s_val[i] = 0
+        else:
+            cur_s = [S[i][j].X for j in range(s_len[i])]
+            s_val[i] = get_non_zero_index(cur_s)
+
+    e_val = np.full((len(E),), -1, dtype=np.int32)
+    for (idx, (i, j)) in enumerate(E):
+        e_val[idx] = s_val[i] * s_len[j] + s_val[j]
+    
+    R_val = []
+    for i in range(T):
+        R_val.append([j for j in range(N) if A[i, get_segment_idx(j)].X == 1])
+    
+    # Check correctness
+    for (idx, (i, j)) in enumerate(E):
+        i_spec_index = e_val[idx] // s_len[j]
+        j_spec_index = e_val[idx] % s_len[j]
+        assert i_spec_index == s_val[i], f"e_val[{i}][{j}]"
+        assert j_spec_index == s_val[j], f"e_val[{i}][{j}]"
+
+    print(f"==================={model.ObjVal} {len(s_val)}================")
+    print(get_child(12))
+    peak_mem = 0
+    for t in range(T):
+        for k in range(T):
+            peak_mem = max(peak_mem, model.getVarByName(f'U[{t},{k}]').X)
+    print(f"==========Solver Peak Memory {peak_mem/1024/1024} MB")
+    return s_val, e_val, R_val, segments, model.ObjVal, None                        
+
+def _call_solver_ckmt(  N,
+                        M,
+                        s_len_np,
+                        s_follow_np,
+                        E_np,
+                        A_np,
+                        L_np,
+                        c_np,
+                        d_np,
+                        m_np,
+                        r_np,
+                        v_np,
+                        elementwise_np,
+                        param_np,
+                        tuple_np,
+                        s_init_np=None):
+    
+    import gurobipy as gp
+    from gurobipy import GRB, quicksum
+
+    print("IN CALL SOLVER CHECKMATE")
+    print(f"{N} nodes, {len(elementwise_np)} Elementwise Ops, {len(param_np)} Params, {M/1024/1024} MB memory limit")
+
+    for x in [s_len_np, E_np, A_np, L_np, c_np, d_np, m_np, r_np, v_np]:
+        assert isinstance(x, np.ndarray)
+    assert len(s_len_np) == N, "s_len_np"
+
+    # 0. Unpack flatten numpy arrays
+    s_len = s_len_np
+    s_follow = s_follow_np
+
+    E = E_np.reshape((-1, 2))  # noqa
+    r = []
+    pt = 0
+    edge_set = set()
+    for (i, j) in E:
+        prod_length = s_len[i] * s_len[j]
+
+        if (i, j) in edge_set:
+            raise ValueError(f"Duplicated edges: {(i, j)}")
+
+        edge_set.add((i, j))
+        r.append(r_np[pt:pt + prod_length])
+        pt += prod_length
+    assert pt == len(r_np)
+
+    A = A_np.reshape((-1, 2))  # noqa
+    v = []
+    pt = 0
+    for (i, j) in A:
+        prod_length = s_len[i] * s_len[j]
+        v.append(v_np[pt:pt + prod_length])
+        pt += prod_length
+    assert pt == len(v_np)
+
+    L = []  # noqa
+    pt = N
+    for i in range(N):
+        length = L_np[i]
+        L.append(L_np[pt:pt + length])
+        pt += length
+    assert pt == len(L_np)
+
+    c = []
+    d = []
+    m = []
+    pt = 0
+    # compute cost is at least 1 so that ckmt will not compute readudant nodes
+    for i in range(N):
+        length = s_len[i]
+        c.append(np.clip(c_np[pt:pt + length], 10, max(10, max(c_np[pt:pt + length]))))
         d.append(d_np[pt:pt + length])
         m.append(m_np[pt:pt + length])
         pt += length
@@ -752,9 +1077,6 @@ def _call_solver_ckmt(  N,
             for i in range(d2):
                 model.addConstr(variable[t, i], GRB.EQUAL, fixv[t][i])
     
-    # Set memory limit if not defined to 10 GB
-    if M < 0:
-        M = 10*1024*1024*1024
     
     A = model.addVars(T, N, name="A", vtype=GRB.BINARY, lb=0.0, ub=1.0)
     B = model.addVars(T, N, name="B", vtype=GRB.BINARY, lb=0.0, ub=1.0)
@@ -782,10 +1104,11 @@ def _call_solver_ckmt(  N,
         S[i] = S[s_follow[i]]
     
 
-    # Never checkpoint elementwise ops
-    for i in elementwise_idx:
-        for t in range(T):
-            B[t, i] = 0
+    # # Never checkpoint elementwise ops
+    # comment this for now for debugging (recompuet as few nodes as possible)
+    # for i in elementwise_idx:
+    #     for t in range(T):
+    #         B[t, i] = 0
     
     E_sol = []
     for (i, j) in E:
@@ -851,6 +1174,8 @@ def _call_solver_ckmt(  N,
     for t in range(T):
         for i in range(segments[t][0], segments[t][1]):
             model.addConstr(A[t, i], GRB.EQUAL, 1)
+        # for i in range(segments[t][0]):
+        #     model.addConstr(A[t, i], GRB.EQUAL, 0)
 
     for t in range(T):
         for i in range(N):
@@ -903,12 +1228,12 @@ def _call_solver_ckmt(  N,
         assert j_spec_index == s_val[j], f"e_val[{i}][{j}]"
 
     print(f"==================={model.ObjVal} {len(s_val)}================")
-
+    print(get_child(12))
     peak_mem = 0
     for t in range(T):
         for k in range(N):
             peak_mem = max(peak_mem, model.getVarByName(f'U[{t},{k}]').X)
-    
+    print(f"==========Solver Peak Memory {peak_mem/1024/1024} MB")
     return s_val, e_val, R_val, segments, model.ObjVal, None
 
 # pylint: disable=import-outside-toplevel
