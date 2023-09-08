@@ -111,7 +111,7 @@ class MeshHostWorker:
 
     def __init__(self, server_address: str, num_hosts: int, host_id: int,
                  mesh_id: int, move_worker: DaemonMoveWorker,
-                 runtime_random_seed: int):
+                 runtime_random_seed: int, worker_global_config: dict):
         self.num_hosts = num_hosts
         self.host_id = host_id
         self.mesh_id = mesh_id
@@ -124,6 +124,9 @@ class MeshHostWorker:
         self.distributed_client.connect()
         logger.debug(
             f"{host_id}: Success to connect to xla runtime at {server_address}")
+
+        # Set global config to follow the driver
+        global_config.update_worker_config(worker_global_config)
         if global_config.backend == "gpu":
             self.backend = xla_client.make_gpu_client(self.distributed_client,
                                                       node_id=host_id)
@@ -638,6 +641,7 @@ class PhysicalDeviceMesh(ABC):
     num_devices_per_host: int
     mesh_id: int
     operation_executables: dict
+    one_replica_ids: dict
 
     def get_signature(self) -> str:
         """Return a signature string that contains the mesh shape and GPU
@@ -647,6 +651,27 @@ class PhysicalDeviceMesh(ABC):
         ret = f"{self.num_hosts},{self.num_devices_per_host},{gpu_name}"
         ret = ret.replace(" ", "-")
         return ret
+
+    def _compute_one_replica_ids(self, indices, aval_shape, sharding_spec):
+        # Tuple (aval_shape, sharding_spec) is 1-1 mapped to indices
+        # used to compute one_replica_ids
+        if (aval_shape, sharding_spec) in self.one_replica_ids:
+            return self.one_replica_ids[(aval_shape, sharding_spec)]
+
+        one_replica_indices = []
+        one_replica_host_local_ids = []
+        seen_index_hashes = set()
+        for i, index in enumerate(indices):
+            hashed_index = _hashable_index(index)
+            if hashed_index not in seen_index_hashes:
+                one_replica_indices.append(i)
+                one_replica_host_local_ids.append(
+                    divmod(i, self.num_devices_per_host))
+                seen_index_hashes.add(hashed_index)
+        self.one_replica_ids[(
+            aval_shape,
+            sharding_spec)] = one_replica_indices, one_replica_host_local_ids
+        return one_replica_indices, one_replica_host_local_ids
 
     @property
     def shape(self):
@@ -845,6 +870,7 @@ class LocalPhysicalDeviceMesh(PhysicalDeviceMesh):
         self.mesh_id = -1
         self.device_strs = []
         self.operation_executables = {}
+        self.one_replica_ids = {}
 
         self.backend = xb.get_backend(global_config.backend)
 
@@ -974,6 +1000,7 @@ class DistributedPhysicalDeviceMesh(PhysicalDeviceMesh):
         self.workers = None
         self.service_server = None
         self.operation_executables = {}
+        self.one_replica_ids = {}
         self.namespace = namespace
 
         if devices is not None:
@@ -1115,7 +1142,8 @@ class DistributedPhysicalDeviceMesh(PhysicalDeviceMesh):
                                      "env_vars": env_vars
                                  }).remote(server_address, self.num_hosts, i,
                                            self.mesh_id, move_worker,
-                                           global_config.runtime_random_seed)
+                                           global_config.runtime_random_seed,
+                                           global_config)
             workers.append(worker)
         return service_server, workers
 
@@ -1485,9 +1513,9 @@ class DistributedArray:
     a normal numpy array.
 
     Internally, it stores a pointer to all remote buffers.
-    The buffers are stored distributedly on remote workers' device memeory.
+    The buffers are stored distributedly on remote workers' device memory.
     When users require the value of the array. These buffers will be gathered
-    to the dirver.
+    to the driver.
     """
 
     def __init__(self,
@@ -1508,8 +1536,6 @@ class DistributedArray:
         self.shape = self.aval.shape
         self.dtype = self.aval.dtype
         self._npy_value = None
-        self._one_replica_host_local_ids = None
-        self._one_replica_buffer_ids = None
         self._fetched_np_buffers = None
         self._fetched_np_buffers_ref = None
         self.skip_shard_args_check = False
@@ -1528,7 +1554,7 @@ class DistributedArray:
 
     def block_until_ready(self):
         """Block until all remote buffers of this array are ready."""
-        self.device_mesh.block_until_ready_remote_buffers(self.uuid)
+        self.device_mesh.block_until_ready_remote_buffers([self.remote_ref])
 
     def delete(self):
         self.remote_ref = None
@@ -1616,34 +1642,16 @@ class DistributedArray:
         return DistributedArray(device_mesh, aval, sharding_spec, ary_ref,
                                 indices)
 
-    def _compute_one_replica_ids(self):
-        one_replica_indices = []
-        one_replica_host_local_ids = []
-        seen_index_hashes = set()
-        for i, index in enumerate(self.indices):
-            hashed_index = _hashable_index(index)
-            if hashed_index not in seen_index_hashes:
-                one_replica_indices.append(i)
-                one_replica_host_local_ids.append(
-                    divmod(i, self.device_mesh.num_devices_per_host))
-                seen_index_hashes.add(hashed_index)
-        self._one_replica_buffer_ids = one_replica_indices
-        self._one_replica_host_local_ids = one_replica_host_local_ids
-
-    # TODO(yonghao): to make ._value faster(in reorder buffer), cache different
-    # buffers with the same mesh shape and sharding spec.
     @property
     def one_replica_buffer_ids(self):
         """Indices of buffers containing one complete copy of the array data."""
-        if self._one_replica_buffer_ids is None:
-            self._compute_one_replica_ids()
-        return self._one_replica_buffer_ids
+        return self.device_mesh._compute_one_replica_ids(
+            self.indices, self.aval.shape, self.sharding_spec)[0]
 
     @property
     def one_replica_host_local_ids(self):
-        if self._one_replica_host_local_ids is None:
-            self._compute_one_replica_ids()
-        return self._one_replica_host_local_ids
+        return self.device_mesh._compute_one_replica_ids(
+            self.indices, self.aval.shape, self.sharding_spec)[1]
 
     @property
     def _value(self):
@@ -2304,6 +2312,7 @@ global_virtual_physical_mesh: VirtualPhysicalMesh = None
 
 
 def init_global_cluster(cluster: str,
+                        cluster_address: Optional[str] = None,
                         num_nodes: Optional[int] = None,
                         num_devices_per_node: Optional[int] = None,
                         namespace: Optional[str] = None):
@@ -2313,7 +2322,8 @@ def init_global_cluster(cluster: str,
         global_physical_mesh = LocalPhysicalDeviceMesh()
     elif cluster == "ray":
         if not ray.is_initialized():
-            ray.init(address="auto",
+            ray_addr = cluster_address if cluster_address else "auto"
+            ray.init(address=ray_addr,
                      ignore_reinit_error=True,
                      namespace=namespace)
         update_jax_platform("cpu")
